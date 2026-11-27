@@ -1,7 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 import type { CopilotTasksApi, CreateTaskRequest, SteerRequest, Task, TaskEvent } from "./api";
+import type { TaskCache, TaskSnapshot } from "./cache";
 import { CloudTaskSession } from "./session";
+
+class MemoryCache implements TaskCache {
+  readonly snapshots = new Map<string, TaskSnapshot>();
+  async load(taskId: string) {
+    return structuredClone(this.snapshots.get(taskId) ?? null);
+  }
+  async save(taskId: string, snapshot: TaskSnapshot) {
+    this.snapshots.set(taskId, structuredClone(snapshot));
+  }
+}
 
 class FakeApi {
   task: Task = { id: "task-1", state: "queued", remote_steerable: true, sessions: [] };
@@ -34,12 +45,14 @@ function prompt(text: string, id = "c1") {
 
 describe("CloudTaskSession", () => {
   let api: FakeApi;
+  let cache: MemoryCache;
   let events: ProviderEvent[];
   let session: CloudTaskSession;
 
   beforeEach(() => {
     vi.useFakeTimers();
     api = new FakeApi();
+    cache = new MemoryCache();
     events = [];
     session = new CloudTaskSession({
       api: api as unknown as CopilotTasksApi,
@@ -48,6 +61,7 @@ describe("CloudTaskSession", () => {
       repo: { owner: "acme", name: "app" },
       model: "claude-opus-5.5",
       mode: "default",
+      cache,
       emit: (event) => events.push(event),
       log: () => {},
     });
@@ -62,7 +76,11 @@ describe("CloudTaskSession", () => {
   it("starts a task on the first prompt, follows it, and ends the turn when it rests", async () => {
     await session.prompt(prompt("Fix the bug"));
     expect(api.created).toEqual([{ prompt: "Fix the bug", repositories: [{ owner: "acme", name: "app" }], model: "claude-opus-5.5" }]);
-    expect(events).toContainEqual({ type: "session.persistence", sessionId: "s1", persistence: { version: 1, data: { taskId: "task-1" } } });
+    expect(events).toContainEqual({
+      type: "session.persistence",
+      sessionId: "s1",
+      persistence: { version: 1, data: { taskId: "task-1" } },
+    });
 
     api.task = { ...api.task, state: "in_progress" };
     api.push("user.message", { content: "Fix the bug", transformedContent: "<ctx>Fix the bug" });
@@ -102,6 +120,7 @@ describe("CloudTaskSession", () => {
       repo: null,
       model: "auto",
       mode: "default",
+      cache,
       emit: (event) => events.push(event),
       log: () => {},
     });
@@ -116,6 +135,65 @@ describe("CloudTaskSession", () => {
     await linked.prompt(prompt("Follow-up"));
     expect(api.steers).toEqual([{ type: "user_message", content: "Follow-up" }]);
     linked.stop();
+  });
+
+  const texts = () => events.flatMap((event) => (event.type === "timeline.item" && "text" in event.item ? [event.item.text] : []));
+
+  function reopened(sessionId: string) {
+    return new CloudTaskSession({
+      api: api as unknown as CopilotTasksApi,
+      paseoSessionId: sessionId,
+      task: api.task,
+      repo: null,
+      model: "auto",
+      mode: "default",
+      cache,
+      emit: (event) => events.push(event),
+      log: () => {},
+    });
+  }
+
+  it("reopens from its cache: replays what it showed, reads only newer events, re-raises open requests", async () => {
+    api.task = { ...api.task, state: "waiting_for_user" };
+    api.push("user.message", { content: "Old", transformedContent: "<ctx>Old" });
+    api.push("user_input.requested", { requestId: "q1", question: "Pick A or B", choices: ["A", "B"] });
+    const first = reopened("s3");
+    await first.attach({ catchUp: true });
+    await vi.advanceTimersByTimeAsync(2_000);
+    first.stop();
+    expect(cache.snapshots.get("task-1")).toMatchObject({ cursor: "e2", pending: [{ requestId: "q1" }] });
+
+    events = [];
+    const reads: Array<string | null> = [];
+    const allEvents = api.allEvents.bind(api);
+    api.allEvents = async (id: string, after: string | null) => {
+      reads.push(after);
+      return allEvents(id, after);
+    };
+    api.push("assistant.message", { messageId: "m9", content: "New answer" });
+    const second = reopened("s4");
+    await second.attach({ reopen: { replay: true } });
+    // Replayed while opening, before any request to GitHub.
+    expect(texts()).toEqual(["Old"]);
+    expect(events).toContainEqual(expect.objectContaining({ type: "session.permission", request: expect.objectContaining({ id: "q1" }) }));
+    expect(reads).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reads).toEqual(["e2"]);
+    expect(texts()).toEqual(["Old", "New answer"]);
+    second.stop();
+  });
+
+  it("reopens an agent without a cache by reading the whole history, then caches it", async () => {
+    api.task = { ...api.task, state: "completed" };
+    api.push("user.message", { content: "Old", transformedContent: "<ctx>Old" });
+    api.push("assistant.message", { messageId: "m1", content: "Old answer" });
+    const resumed = reopened("s5");
+    await resumed.attach({ reopen: { replay: true } });
+    expect(texts()).toEqual(["Old", "Old answer"]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cache.snapshots.get("task-1")).toMatchObject({ cursor: "e2", items: [{ text: "Old" }, { text: "Old answer" }] });
+    resumed.stop();
   });
 
   it("explains a refused steer and keeps the card when an idle interactive task rejects input", async () => {

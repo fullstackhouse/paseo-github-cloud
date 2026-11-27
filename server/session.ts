@@ -9,10 +9,12 @@ import type {
   ProviderTimelineItem,
 } from "@getpaseo/plugin/server/provider";
 import { RESTING_STATES, type CopilotTasksApi, type SteerRequest, type Task, type TaskState } from "./api";
+import type { TaskCache } from "./cache";
 import type { GitHubRepo } from "./repo";
 import { TimelineMapper, type PendingRequest } from "./timeline";
 
 export const DEFAULT_MODEL = "auto";
+
 export const DEFAULT_MODE = "default";
 
 /** Fallback catalogue; the provider replaces it with `/agents/swe/models` when that answers. */
@@ -51,6 +53,7 @@ interface Options {
   model: string;
   mode: string;
   models?: ProviderModel[];
+  cache: TaskCache;
   emit: (event: ProviderEvent) => void;
   log: (message: string) => void;
 }
@@ -71,10 +74,14 @@ export class CloudTaskSession {
   /** Prompts Paseo already drew; their echoes from the task are skipped. */
   private readonly echoes: string[] = [];
   private readonly models: ProviderModel[];
+  private readonly cache: TaskCache;
+  /** Every timeline item shown, latest version of each, for the cache a reopened agent replays. */
+  private readonly items = new Map<string, ProviderTimelineItem>();
   private task: Task | null;
   private model: string;
   private mode: string;
   private cursor: string | null = null;
+  private saving: Promise<void> = Promise.resolve();
   private turn: Turn | null = null;
   private turnCounter = 0;
   private stopped = false;
@@ -88,29 +95,46 @@ export class CloudTaskSession {
     this.model = options.model;
     this.mode = options.mode;
     this.models = options.models ?? MODELS;
+    this.cache = options.cache;
     this.emit = options.emit;
     this.log = options.log;
   }
 
   /**
-   * Reads the task's history (rendering it when `replay`), raises requests it still waits on, then
-   * follows it. `catchUp` leaves the whole history to the first poll, which emits it as live events.
+   * Starts following the task.
+   * - `catchUp`: a task a link just opened. The first poll emits its whole history as live events:
+   *   Paseo drops timeline items a new agent emits while opening.
+   * - `reopen`: an agent Paseo restores or reloads. Paseo rebuilds its timeline from what the provider
+   *   emits while opening, so this replays the cached timeline (instant) and polls from its cursor.
+   *   Without a cache (agents from older versions) it reads the whole history first, which for a long
+   *   task takes close to Paseo's 60 s refresh deadline.
    */
-  async attach(options: { replay: boolean } | { catchUp: true }): Promise<void> {
+  async attach(options: { catchUp: true } | { reopen: { replay: boolean } }): Promise<void> {
     if (!this.task) return;
     if ("catchUp" in options) {
       this.schedule(ACTIVE_POLL_MS);
       return;
     }
-    const { replay } = options;
-    const events = await this.api.allEvents(this.task.id, null);
-    for (const event of events) {
-      const mapped = this.mapper.map(event);
-      if (replay) for (const item of mapped.items) this.emitItem(item);
-      this.track(mapped.request, mapped.resolves, mapped.mode);
+    const { replay } = options.reopen;
+    const snapshot = await this.cache.load(this.task.id);
+    if (snapshot) {
+      for (const item of snapshot.items) {
+        this.items.set(item.id, item);
+        if (replay) this.emit({ type: "timeline.item", sessionId: this.sessionId, item });
+      }
+      for (const request of snapshot.pending) this.pending.set(request.requestId, request);
+      this.cursor = snapshot.cursor;
+    } else {
+      const events = await this.api.allEvents(this.task.id, null);
+      for (const event of events) {
+        const mapped = this.mapper.map(event);
+        for (const item of mapped.items) (replay ? this.emitItem(item) : this.items.set(item.id, item));
+        this.track(mapped.request, mapped.resolves, mapped.mode);
+      }
+      for (const item of this.mapper.closeOpenTools("completed")) (replay ? this.emitItem(item) : this.items.set(item.id, item));
+      this.cursor = events.at(-1)?.id ?? null;
+      this.save();
     }
-    if (replay) for (const item of this.mapper.closeOpenTools("completed")) this.emitItem(item);
-    this.cursor = events.at(-1)?.id ?? null;
     for (const request of this.pending.values()) this.raise(request);
     if (!RESTING_STATES.has(this.task.state)) this.beginTurn(true);
     this.schedule(0);
@@ -220,6 +244,17 @@ export class CloudTaskSession {
       ...this.modelField(),
     });
     this.emit({ type: "session.persistence", sessionId: this.sessionId, persistence: { version: 1, data: { taskId: this.task.id } } });
+    this.save();
+  }
+
+  /** Writes the cache a reopened agent replays. Writes run one at a time, in order. */
+  private save(): void {
+    const task = this.task;
+    if (!task) return;
+    const snapshot = { cursor: this.cursor, pending: [...this.pending.values()], items: [...this.items.values()] };
+    this.saving = this.saving
+      .then(() => this.cache.save(task.id, snapshot))
+      .catch((error) => this.log(`saving the task cache failed: ${errorMessage(error)}`));
   }
 
   private async answerQuestion(question: PendingRequest, answer: string | null): Promise<void> {
@@ -284,7 +319,10 @@ export class CloudTaskSession {
       const raised = this.track(mapped.request, mapped.resolves, mapped.mode);
       if (raised) this.raise(raised);
     }
-    if (events.length > 0) this.cursor = events.at(-1)!.id;
+    if (events.length > 0) {
+      this.cursor = events.at(-1)!.id;
+      this.save();
+    }
     this.advanceTurn(task.state);
   }
 
@@ -410,6 +448,7 @@ export class CloudTaskSession {
   }
 
   private emitItem(item: ProviderTimelineItem): void {
+    this.items.set(item.id, item);
     this.emit({ type: "timeline.item", sessionId: this.sessionId, item });
   }
 }

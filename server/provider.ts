@@ -9,6 +9,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { CopilotTasksApi } from "./api";
 import { readRepo } from "./repo";
+import { fileTaskCache, type TaskCache } from "./cache";
 import { CloudTaskSession, DEFAULT_MODE, DEFAULT_MODEL, MODELS, MODES, configState } from "./session";
 
 const CAPABILITIES = ["prompt.message", "prompt.steer", "session.persistence", "session.configure", "permission"] as const;
@@ -19,10 +20,12 @@ interface Deps {
   log: (message: string) => void;
   /** Injected in tests. */
   connectApi?: (env: Readonly<Record<string, string>>) => Promise<CopilotTasksApi>;
+  cache?: TaskCache;
 }
 
 export function createGitHubCloudProvider(deps: Deps): ProviderRegistration {
   const connectApi = deps.connectApi ?? ((env) => CopilotTasksApi.connect(env));
+  const cache = deps.cache ?? fileTaskCache();
   return {
     id: PROVIDER_ID,
     label: "GitHub Copilot (cloud)",
@@ -38,7 +41,7 @@ export function createGitHubCloudProvider(deps: Deps): ProviderRegistration {
     },
     async connect(request) {
       if (!request.versions.includes(1)) throw new Error("Provider protocol version 1 is required");
-      return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES), deps.log, connectApi);
+      return createConnection(negotiateProviderCapabilities(request.capabilities, CAPABILITIES), deps.log, connectApi, cache);
     },
   };
 }
@@ -47,6 +50,7 @@ function createConnection(
   capabilities: readonly string[],
   log: (message: string) => void,
   connectApi: (env: Readonly<Record<string, string>>) => Promise<CopilotTasksApi>,
+  cache: TaskCache,
 ): ProviderConnection {
   const listeners = new Set<(event: ProviderEvent) => void>();
   const sessions = new Map<string, CloudTaskSession>();
@@ -76,7 +80,7 @@ function createConnection(
         return;
       case "session.open":
         try {
-          sessions.set(input.sessionId, await openSession(input, emit, log, connectApi));
+          sessions.set(input.sessionId, await openSession(input, emit, log, connectApi, cache));
         } catch (error) {
           fail(input.requestId, error);
         }
@@ -148,6 +152,7 @@ async function openSession(
   emit: (event: ProviderEvent) => void,
   log: (message: string) => void,
   connectApi: (env: Readonly<Record<string, string>>) => Promise<CopilotTasksApi>,
+  cache: TaskCache,
 ): Promise<CloudTaskSession> {
   const { config } = input;
   const api = await connectApi(config.env);
@@ -160,7 +165,7 @@ async function openSession(
   const mode = config.mode ?? DEFAULT_MODE;
 
   const models = await loadModels(api).catch(() => MODELS);
-  const session = new CloudTaskSession({ api, paseoSessionId: input.sessionId, task, repo, model, mode, models, emit, log });
+  const session = new CloudTaskSession({ api, paseoSessionId: input.sessionId, task, repo, model, mode, models, cache, emit, log });
   emit({
     type: "session.opened",
     requestId: input.requestId,
@@ -174,7 +179,7 @@ async function openSession(
   emit({ type: "session.config", sessionId: input.sessionId, config: configState(model, mode, models) });
   // A task opened from a link has no Paseo history yet. Paseo drops timeline items a new agent emits
   // while opening, so its history arrives through the first poll instead.
-  if (task) await session.attach(input.persistence ? { replay: input.history === "replay" } : { catchUp: true });
+  if (task) await session.attach(input.persistence ? { reopen: { replay: input.history === "replay" } } : { catchUp: true });
   emit({ type: "session.ready", requestId: input.requestId, sessionId: input.sessionId });
   return session;
 }
