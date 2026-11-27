@@ -11,9 +11,10 @@ in GitHub's sandbox and bills to your Copilot plan.
 - **Task links:** a `github.com/<owner>/<repo>/tasks/<id>` link in chat opens the task as a Paseo agent,
   with its history, in a workspace on that repository. Right-click a link for **Open as Paseo agent**.
   Opening the same task again reuses its agent.
-- **Interactive tasks:** tasks started on github.com in the interactive sandbox report their mode
-  (Interactive, Plan, Autopilot). Plan approvals and the agent's questions show as cards; you can also
-  answer a question by typing.
+- **Interactive tasks:** tasks started on github.com in the interactive sandbox open with their history,
+  mode (Interactive, Plan, Autopilot), plan approvals and questions, and Paseo follows their progress. GitHub
+  doesn't take messages or answers for them from Paseo while the sandbox is idle (github.com and VS Code use a
+  separate relay protocol), so Paseo points you to the task on github.com instead.
 - **Work started elsewhere:** messages sent from github.com show up in Paseo, which polls the task every
   2 s while it works and every 10 s while it rests.
 

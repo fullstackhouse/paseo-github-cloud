@@ -118,6 +118,34 @@ describe("CloudTaskSession", () => {
     linked.stop();
   });
 
+  it("explains a refused steer and keeps the card when an idle interactive task rejects input", async () => {
+    await session.prompt(prompt("Plan it"));
+    api.task = { ...api.task, state: "idle", repository: { name: "app", full_name: "acme/app" } };
+    api.push("user_input.requested", { requestId: "q1", question: "Pick A or B", choices: ["A", "B"] });
+    await vi.advanceTimersByTimeAsync(2_000);
+    api.steer = async () => {
+      throw new Error("POST /tasks/task-1/steer failed (422): unprocessable: session is not steerable");
+    };
+
+    await session.respondToPermission("q1", { behavior: "allow", selectedActionId: "choice:A" });
+    expect(events).not.toContainEqual({ type: "session.permission_resolved", sessionId: "s1", permissionId: "q1" });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "timeline.item",
+        item: expect.objectContaining({ type: "error", message: expect.stringContaining("https://github.com/acme/app/tasks/task-1") }),
+      }),
+    );
+
+    await session.prompt(prompt("Hello", "c9"));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "session.prompt_result",
+        clientMessageId: "c9",
+        result: { type: "failed", error: { message: expect.stringContaining("Reply on github.com") } },
+      }),
+    );
+  });
+
   it("raises a plan approval and answers it through steer", async () => {
     await session.prompt(prompt("Plan it"));
     api.task = { ...api.task, state: "waiting_for_user" };

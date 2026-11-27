@@ -167,6 +167,17 @@ export class CloudTaskSession {
     const request = this.pending.get(permissionId);
     if (!request) return;
     const allow = response.behavior === "allow";
+    try {
+      await this.answer(request, response, allow);
+    } catch (error) {
+      this.emitItem({ type: "error", id: `answer:${permissionId}:${Date.now()}`, message: errorMessage(error) });
+      return;
+    }
+    this.resolve(permissionId);
+    this.schedule(ACTIVE_POLL_MS);
+  }
+
+  private async answer(request: PendingRequest, response: ProviderPermissionResponse, allow: boolean): Promise<void> {
     switch (request.kind) {
       case "plan": {
         const action = allow ? response.selectedActionId?.replace(/^plan:/, "") : undefined;
@@ -175,7 +186,7 @@ export class CloudTaskSession {
           content: JSON.stringify({
             approved: allow,
             ...(action ? { selectedAction: action } : {}),
-            ...(!allow && response.message ? { feedback: response.message } : {}),
+            ...(response.behavior === "deny" && response.message ? { feedback: response.message } : {}),
           }),
           event_identifiers: [allow ? "plan_approved" : "plan_dismissed"],
         });
@@ -193,8 +204,6 @@ export class CloudTaskSession {
         });
         break;
     }
-    this.resolve(permissionId);
-    this.schedule(ACTIVE_POLL_MS);
   }
 
   /** Stops following the task. The task keeps running on GitHub. */
@@ -235,7 +244,16 @@ export class CloudTaskSession {
 
   private async steer(request: SteerRequest): Promise<void> {
     if (!this.task) throw new Error("The task has not started yet");
-    await this.api.steer(this.task.id, request);
+    try {
+      await this.api.steer(this.task.id, request);
+    } catch (error) {
+      // Interactive sandbox tasks (started on github.com) take input over GitHub's relay protocol, not
+      // this API, and refuse it here once the sandbox idles.
+      if (/not steerable/i.test(errorMessage(error))) {
+        throw new Error(`GitHub doesn't accept input for this task from Paseo while it's idle. Reply on github.com: ${taskUrl(this.task)}`);
+      }
+      throw error;
+    }
   }
 
   private schedule(delayMs: number): void {
@@ -394,6 +412,11 @@ export class CloudTaskSession {
   private emitItem(item: ProviderTimelineItem): void {
     this.emit({ type: "timeline.item", sessionId: this.sessionId, item });
   }
+}
+
+function taskUrl(task: Task): string {
+  const repo = task.repository?.full_name ?? task.repositories?.[0]?.full_name;
+  return task.html_url ?? (repo ? `https://github.com/${repo}/tasks/${task.id}` : `https://github.com/copilot/agents`);
 }
 
 function lastSessionError(task: Task | null): string {

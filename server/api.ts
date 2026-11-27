@@ -129,7 +129,9 @@ export class CopilotTasksApi {
 
   /** One page of events after `after` (oldest first) and the cursor for the next page, if any. */
   async events(taskId: string, after: string | null): Promise<{ events: TaskEvent[]; next: string | null }> {
-    const query = new URLSearchParams({ per_page: "100" });
+    // Each request takes ~8 s whatever its size. Large pages keep a long history (casteo: 9k events) to two
+    // requests, so reopening a session stays under the 60 s agent-refresh deadline.
+    const query = new URLSearchParams({ per_page: "5000" });
     if (after) query.set("after", after);
     const response = await this.fetch("GET", `/tasks/${encodeURIComponent(taskId)}/events?${query}`);
     const body = (await response.json()) as { events: TaskEvent[] };
