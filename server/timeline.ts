@@ -45,7 +45,9 @@ export class TimelineMapper {
     switch (event.type) {
       case "user.message": {
         if (!isUserAuthored(data)) return { items: [] };
-        return { items: [{ type: "user_message", id: event.id, text: str(data.content) }] };
+        // Relay-sent messages carry the turn id Paseo drew them under; reuse it so they replace that bubble.
+        const turn = str(data.clientTurnId);
+        return { items: [{ type: "user_message", id: turn ? `user:turn:${turn}` : event.id, text: str(data.content) }] };
       }
       case "assistant.message": {
         const text = str(data.content).trim();

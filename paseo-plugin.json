@@ -4,5 +4,12 @@
   "description": "Run GitHub Copilot cloud agent tasks as Paseo agents, and open github.com task links in Paseo.",
   "requirements": {
     "paseo": ">=0.17.1"
-  }
+  },
+  "build": [
+    [
+      "npm",
+      "ci",
+      "--omit=dev"
+    ]
+  ]
 }

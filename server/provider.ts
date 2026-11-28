@@ -10,7 +10,16 @@ import {
 import { CopilotTasksApi } from "./api";
 import { readRepo } from "./repo";
 import { fileTaskCache, type TaskCache } from "./cache";
-import { CloudTaskSession, DEFAULT_MODE, DEFAULT_MODEL, MODELS, MODES, configState } from "./session";
+import {
+  CloudTaskSession,
+  DEFAULT_MODE,
+  DEFAULT_MODEL,
+  MODELS,
+  MODES,
+  PULL_REQUEST_MODE,
+  configState,
+  taskKind,
+} from "./session";
 
 const CAPABILITIES = ["prompt.message", "prompt.steer", "session.persistence", "session.configure", "permission"] as const;
 
@@ -162,7 +171,16 @@ async function openSession(
   // New agents start a task on their first prompt, on the workspace's repository.
   const repo = task ? null : await readRepo(config.cwd);
   const model = config.model ?? task?.sessions?.at(-1)?.model ?? DEFAULT_MODEL;
-  const mode = config.mode ?? DEFAULT_MODE;
+  const kind = taskKind(task);
+  // Older agents saved mode "default"; a task's own kind decides what its mode can be.
+  const mode =
+    kind === "pull-request"
+      ? PULL_REQUEST_MODE
+      : config.mode && config.mode !== PULL_REQUEST_MODE && config.mode !== "default"
+        ? config.mode
+        : kind === "new" && config.mode === PULL_REQUEST_MODE
+          ? PULL_REQUEST_MODE
+          : DEFAULT_MODE;
 
   const models = await loadModels(api).catch(() => MODELS);
   const session = new CloudTaskSession({ api, paseoSessionId: input.sessionId, task, repo, model, mode, models, cache, emit, log });
@@ -176,7 +194,7 @@ async function openSession(
     title: config.title ?? task?.name,
     cwd: config.cwd,
   });
-  emit({ type: "session.config", sessionId: input.sessionId, config: configState(model, mode, models) });
+  emit({ type: "session.config", sessionId: input.sessionId, config: configState(model, mode, models, kind) });
   // A task opened from a link has no Paseo history yet. Paseo drops timeline items a new agent emits
   // while opening, so its history arrives through the first poll instead.
   if (task) await session.attach(input.persistence ? { reopen: { replay: input.history === "replay" } } : { catchUp: true });

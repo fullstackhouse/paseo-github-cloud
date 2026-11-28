@@ -30,6 +30,10 @@ export interface TaskSession {
   id: string;
   state: TaskState;
   model?: string;
+  /** The sandbox environment the session runs in (interactive tasks). */
+  environment_id?: string;
+  /** The session's relay resource, e.g. `ahp-session:/<id>`. */
+  ahp_resource_uri?: string;
   error?: { message?: string } | null;
 }
 
@@ -42,6 +46,9 @@ export interface Task {
   repository?: TaskRepository;
   repositories?: TaskRepository[];
   sessions?: TaskSession[];
+  current_environment?: { id?: string; kind?: string } | null;
+  compute?: { provider?: string } | null;
+  agent_collaborators?: Array<{ slug?: string }>;
   artifacts?: Array<{ type?: string; data?: { url?: string; html_url?: string; number?: number } }>;
 }
 
@@ -77,9 +84,35 @@ export type SteerRequest =
 export interface CreateTaskRequest {
   prompt: string;
   repositories: Array<{ owner: string; name: string }>;
+  /** `github-sandbox` starts an interactive sandbox task; its first turn is sent over the relay. */
+  environment_id?: string;
   agent_id?: number;
   model?: string;
   base_ref?: string;
+}
+
+/** GitHub couldn't bring the sandbox's host up; it keeps the sandbox, and a later connect may work. */
+export class SandboxUnreachableError extends Error {
+  constructor(readonly detail: string) {
+    super("GitHub couldn't wake the cloud sandbox. It keeps the sandbox; try again in a few minutes.");
+    this.name = "SandboxUnreachableError";
+  }
+}
+
+/** The integration id VS Code OSS sends to Mission Control (a public constant). */
+const INTEGRATION_ID = "code-oss";
+
+/** Relay credentials for one client of a sandbox environment (`/environments/{id}/connect`). */
+export interface RelayToken {
+  access_token: string;
+  expires_at: string;
+  wps_endpoint: string;
+  hub: string;
+  subprotocol: string;
+  client_id: string;
+  groups: { broadcast: string; to_client: string; to_host: string };
+  /** `copilot-sealed.v1.<key_id>.<b64url>`, the GitHub token Mission Control sealed for the host. */
+  encrypted_github_token?: string;
 }
 
 /** Task states in which the agent is not working and waits for the user. */
@@ -113,6 +146,32 @@ export class CopilotTasksApi {
     return body.data
       .filter((model) => model.model_picker_enabled !== false && model.policy?.state !== "disabled")
       .map((model) => ({ id: model.id, name: model.name ?? model.id }));
+  }
+
+  /**
+   * Mints relay credentials for a sandbox environment. A dormant sandbox answers 202 while it wakes;
+   * this waits as `Retry-After` asks, up to `deadlineMs`.
+   */
+  async connectEnvironment(environmentId: string, deadlineMs = 180_000): Promise<RelayToken> {
+    const started = Date.now();
+    for (;;) {
+      let response: Response;
+      try {
+        response = await this.fetch("GET", `/environments/${encodeURIComponent(environmentId)}/connect`, undefined, {
+          "Copilot-Integration-Id": INTEGRATION_ID,
+        });
+      } catch (error) {
+        // 409: "environment did not become reachable after waking". GitHub keeps the sandbox; retry later.
+        if (/failed \(409\)/.test(error instanceof Error ? error.message : "")) throw new SandboxUnreachableError(String(error));
+        throw error;
+      }
+      if (response.status === 200) return (await response.json()) as RelayToken;
+      const retryAfter = Number(response.headers.get("retry-after")) || 5;
+      if (Date.now() - started + retryAfter * 1000 > deadlineMs) {
+        throw new Error("The cloud sandbox didn't wake up in time. Try again in a minute.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+    }
   }
 
   getTask(taskId: string): Promise<Task> {
@@ -156,12 +215,13 @@ export class CopilotTasksApi {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
-  private async fetch(method: string, path: string, body?: unknown): Promise<Response> {
+  private async fetch(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<Response> {
     const response = await fetch(`${this.base}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${this.token}`,
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });

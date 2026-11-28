@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ProviderEvent } from "@getpaseo/plugin/server/provider";
 import type { CopilotTasksApi, CreateTaskRequest, SteerRequest, Task, TaskEvent } from "./api";
 import type { TaskCache, TaskSnapshot } from "./cache";
-import { CloudTaskSession } from "./session";
+import type { TaskInput } from "./input";
+import { CloudTaskSession, PULL_REQUEST_MODE } from "./session";
 
 class MemoryCache implements TaskCache {
   readonly snapshots = new Map<string, TaskSnapshot>();
@@ -39,6 +40,21 @@ class FakeApi {
   }
 }
 
+class RecordingInput implements TaskInput {
+  readonly calls: unknown[][] = [];
+  readonly turnIds: string[] = [];
+  async sendMessage(text: string, options: { turnId?: string } = {}) {
+    if (options.turnId) this.turnIds.push(options.turnId);
+    this.calls.push(["sendMessage", text]);
+  }
+  async answerQuestion(request: { requestId: string }, answer: string | null) { this.calls.push(["answerQuestion", request.requestId, answer]); }
+  async answerPlan(request: { requestId: string }, action: string | null, feedback?: string) { this.calls.push(["answerPlan", request.requestId, action, feedback]); }
+  async confirmPermission(request: { requestId: string }, approved: boolean) { this.calls.push(["confirmPermission", request.requestId, approved]); }
+  async abort() { this.calls.push(["abort"]); }
+  async setMode(mode: string) { this.calls.push(["setMode", mode]); }
+  close() { this.calls.push(["close"]); }
+}
+
 function prompt(text: string, id = "c1") {
   return { clientMessageId: id, delivery: "auto" as const, input: { type: "message" as const, content: [{ type: "text" as const, text }] } };
 }
@@ -60,7 +76,7 @@ describe("CloudTaskSession", () => {
       task: null,
       repo: { owner: "acme", name: "app" },
       model: "claude-opus-5.5",
-      mode: "default",
+      mode: PULL_REQUEST_MODE,
       cache,
       emit: (event) => events.push(event),
       log: () => {},
@@ -205,7 +221,7 @@ describe("CloudTaskSession", () => {
       throw new Error("POST /tasks/task-1/steer failed (422): unprocessable: session is not steerable");
     };
 
-    await session.respondToPermission("q1", { behavior: "allow", selectedActionId: "choice:A" });
+    await session.respondToPermission("q1", { behavior: "allow", updatedInput: { answers: { Answer: "A" } } });
     expect(events).not.toContainEqual({ type: "session.permission_resolved", sessionId: "s1", permissionId: "q1" });
     expect(events).toContainEqual(
       expect.objectContaining({
@@ -222,6 +238,127 @@ describe("CloudTaskSession", () => {
         result: { type: "failed", error: { message: expect.stringContaining("Reply on github.com") } },
       }),
     );
+  });
+
+  describe("interactive sandbox tasks", () => {
+    let input: RecordingInput;
+    let sandbox: CloudTaskSession;
+
+    function sandboxSession(mode: string, task: Task | null = null) {
+      input = new RecordingInput();
+      sandbox = new CloudTaskSession({
+        api: api as unknown as CopilotTasksApi,
+        paseoSessionId: "sb",
+        task,
+        repo: { owner: "acme", name: "app" },
+        model: "auto",
+        mode,
+        cache,
+        inputFor: () => input,
+        emit: (event) => events.push(event),
+        log: () => {},
+      });
+      return sandbox;
+    }
+    afterEach(() => sandbox?.stop());
+
+    it("starts a sandbox task and sends its first message over the relay once the sandbox is assigned", async () => {
+      sandboxSession("plan");
+      api.task = { ...api.task, sessions: [] };
+      const reads = [0];
+      api.getTask = async () => {
+        reads[0]++;
+        return reads[0] < 2 ? api.task : { ...api.task, sessions: [{ id: "s", state: "queued", environment_id: "env-1" }] };
+      };
+      const sent = sandbox.prompt(prompt("Plan the refactor"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await sent;
+      expect(api.created).toEqual([{ prompt: "Plan the refactor", repositories: [{ owner: "acme", name: "app" }], environment_id: "github-sandbox" }]);
+      expect(input.calls).toEqual([["setMode", "plan"], ["sendMessage", "Plan the refactor"]]);
+      expect(api.steers).toEqual([]);
+      // The new task is followed, and its echo of the first message replaces Paseo's bubble.
+      api.task = { ...api.task, state: "completed", sessions: [{ id: "s", state: "completed", environment_id: "env-1" }] };
+      api.getTask = async () => api.task;
+      api.push("user.message", { content: "Plan the refactor", transformedContent: "<ctx>Plan the refactor", clientTurnId: input.turnIds[0] });
+      api.push("assistant.message", { messageId: "m1", content: "Here is the plan." });
+      await vi.advanceTimersByTimeAsync(2_000);
+      const items = events.flatMap((event) => (event.type === "timeline.item" ? [event.item] : []));
+      expect(new Set(items.filter((item) => item.type === "user_message").map((item) => item.id))).toEqual(new Set([`user:turn:${input.turnIds[0]}`]));
+      expect(items).toContainEqual(expect.objectContaining({ type: "assistant_message", text: "Here is the plan." }));
+    });
+
+    it("routes answers, plan reviews, permissions and stop through the task's input", async () => {
+      api.task = { ...api.task, state: "in_progress", sessions: [{ id: "s", state: "in_progress", environment_id: "env-1" }] };
+      sandboxSession("interactive", api.task);
+      await sandbox.attach({ catchUp: true });
+      api.push("user_input.requested", { requestId: "q1", question: "Pick A or B", choices: ["A", "B"] });
+      api.push("exit_plan_mode.requested", { requestId: "p1", planContent: "# Plan", actions: ["autopilot", "interactive", "exit_only"] });
+      api.push("permission.requested", { requestId: "r1", permissionRequest: { toolCallId: "t1" } });
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      await sandbox.respondToPermission("q1", { behavior: "allow", updatedInput: { answers: { Answer: "A" } } });
+      await sandbox.respondToPermission("p1", { behavior: "deny", message: "Smaller steps" });
+      await sandbox.respondToPermission("r1", { behavior: "allow" });
+      await sandbox.prompt(prompt("Keep going", "c2"));
+      await sandbox.interrupt();
+      expect(input.calls).toEqual([
+        ["answerQuestion", "q1", "A"],
+        ["answerPlan", "p1", null, "Smaller steps"],
+        ["confirmPermission", "r1", true],
+        ["sendMessage", "Keep going"],
+        ["abort"],
+      ]);
+      expect(events).toContainEqual({ type: "session.permission_resolved", sessionId: "sb", permissionId: "q1" });
+    });
+
+    it("keeps a turn open while a card waits, so Paseo shows it, and closes it once answered", async () => {
+      api.task = { ...api.task, state: "waiting_for_user", sessions: [{ id: "s", state: "idle", environment_id: "env-1" }] };
+      sandboxSession("interactive", api.task);
+      await sandbox.attach({ catchUp: true });
+      api.push("user_input.requested", { requestId: "q1", question: "Pick A or B", choices: ["A", "B"] });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(turns()).toEqual(["started"]);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session.permission",
+          request: expect.objectContaining({
+            kind: "question",
+            input: { questions: [{ question: "Pick A or B", header: "Answer", options: [{ label: "A" }, { label: "B" }], multiSelect: false, allowOther: true }] },
+          }),
+        }),
+      );
+
+      await sandbox.respondToPermission("q1", { behavior: "allow" });
+      expect(input.calls).toEqual([["answerQuestion", "q1", "A"]]);
+      api.push("user_input.completed", { requestId: "q1", answer: "A" });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(turns()).toEqual(["started", "completed"]);
+    });
+
+    it("draws a relayed message once: the task's echo replaces Paseo's bubble", async () => {
+      api.task = { ...api.task, state: "idle", compute: { provider: "sandboxes" }, sessions: [{ id: "s", state: "idle", environment_id: "env-1" }] };
+      sandboxSession("interactive", api.task);
+      await sandbox.attach({ catchUp: true });
+      await sandbox.prompt(prompt("Hello there", "c5"));
+      await vi.advanceTimersByTimeAsync(0);
+      api.push("user.message", { content: "Hello there", transformedContent: "<ctx>Hello there", clientTurnId: input.turnIds[0] });
+      await vi.advanceTimersByTimeAsync(2_000);
+      const userIds = new Set(
+        events.flatMap((event) => (event.type === "timeline.item" && event.item.type === "user_message" ? [event.item.id] : [])),
+      );
+      expect(userIds).toEqual(new Set([`user:turn:${input.turnIds[0]}`]));
+    });
+
+    it("answers a pending question with the text typed in the composer", async () => {
+      api.task = { ...api.task, state: "waiting_for_user", sessions: [{ id: "s", state: "idle", environment_id: "env-1" }] };
+      sandboxSession("interactive", api.task);
+      await sandbox.attach({ catchUp: true });
+      api.push("user_input.requested", { requestId: "q1", question: "Name?", choices: [] });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await sandbox.prompt(prompt("Ada", "c3"));
+      expect(input.calls).toEqual([["answerQuestion", "q1", "Ada"]]);
+    });
   });
 
   it("raises a plan approval and answers it through steer", async () => {

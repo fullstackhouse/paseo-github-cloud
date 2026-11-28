@@ -25,5 +25,8 @@
     "typescript": "^5.9.3",
     "vitest": "^3.2.7",
     "zod": "^4.4.3"
+  },
+  "dependencies": {
+    "@microsoft/agent-host-protocol": "^1.1.0"
   }
 }
